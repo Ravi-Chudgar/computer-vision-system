@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.task
+.env
+*.docx
+*.wav
+*.mp4
+.linkedin_credentials.json
