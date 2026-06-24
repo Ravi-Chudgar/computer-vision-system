@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Real-time Invisibility · Air Drawing · Lip Reading · Speech-to-Text Notes · LinkedIn
+Real-time Invisibility · Air Drawing · Lip Reading · Speech-to-Text Notes
 
 Controls (camera window):
   D        -> Toggle air-drawing mode (index finger traces shapes)
@@ -13,7 +13,6 @@ Controls (camera window):
   S        -> Start / Stop microphone  (speech → text, auto-saves .docx)
   L        -> Toggle lip landmark overlay
   W        -> Save transcription to Word document (.docx)
-  P        -> Post transcription to LinkedIn (OAuth on first use)
   C        -> Clear all shapes + transcription
   B        -> Re-capture background
   Q        -> Quit
@@ -24,14 +23,10 @@ import json
 import os
 import queue
 import re
-import secrets
 import sys
 import threading
 import time
-import urllib.parse
 import urllib.request
-import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import cv2
 import mediapipe as mp
@@ -56,6 +51,35 @@ try:
 except ImportError:
     SR_AVAILABLE = False
     print("⚠  SpeechRecognition missing → pip install SpeechRecognition")
+
+try:
+    from faster_whisper import WhisperModel as _WhisperModel
+    WHISPER_AVAILABLE = True
+except ImportError:
+    WHISPER_AVAILABLE = False
+
+_WHISPER_MODEL  = None   # set by background preload
+_WHISPER_READY  = False  # True once model is loaded and usable
+_WHISPER_STATUS = ""     # shown in panel notification
+
+def _get_whisper():
+    return _WHISPER_MODEL if _WHISPER_READY else None
+
+def _preload_whisper():
+    """Load the Whisper small model in a background thread."""
+    global _WHISPER_MODEL, _WHISPER_READY, _WHISPER_STATUS
+    if not WHISPER_AVAILABLE:
+        return
+    try:
+        _WHISPER_STATUS = "Whisper loading…"
+        print("  Loading Whisper 'small' model (already cached)…")
+        _WHISPER_MODEL = _WhisperModel("small", device="cpu", compute_type="int8")
+        _WHISPER_READY  = True
+        _WHISPER_STATUS = ""
+        print("  Whisper ready — English / हिंदी / ગુજરાતી supported.")
+    except Exception as ex:
+        _WHISPER_STATUS = ""
+        print(f"  Whisper load failed: {ex} — falling back to Google STT")
 
 try:
     from docx import Document
@@ -298,6 +322,7 @@ class AudioRecorder:
         self.active        = False
         self._buf: list    = []          # raw int16 frames for current chunk
         self._buf_frames   = 0
+        self.language      = "en-US"     # set externally to switch language live
         self._proc_q: queue.Queue = queue.Queue()
         # single background worker handles transcription off the video thread
         self._worker = threading.Thread(target=self._transcribe_loop, daemon=True)
@@ -348,34 +373,60 @@ class AudioRecorder:
         data = _np.concatenate(self._buf)
         self._buf.clear()
         self._buf_frames = 0
-        self._proc_q.put(data)
+        # snapshot language so the worker uses the language active at flush time
+        self._proc_q.put((data, self.language))
 
     def _transcribe_loop(self):
         recognizer = sr.Recognizer() if SR_AVAILABLE else None
         while True:
-            data = self._proc_q.get()
-            if data is None:
+            item = self._proc_q.get()
+            if item is None:
                 break
-            if recognizer is None:
-                continue
+            data, lang = item
             # write temp WAV (stdlib wave — no pyaudio)
             tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
             tmp.close()
             with wave.open(tmp.name, "wb") as wf:
                 wf.setnchannels(self._CHANNELS)
-                wf.setsampwidth(2)              # int16 = 2 bytes/sample
+                wf.setsampwidth(2)
                 wf.setframerate(self._SAMPLE_RATE)
                 wf.writeframes(data.tobytes())
+            text = ""
             try:
-                with sr.AudioFile(tmp.name) as src:
-                    audio = recognizer.record(src)
-                text = recognizer.recognize_google(audio)
-                if text.strip():
-                    self._on_text(text.strip())
-            except Exception:
+                # ── faster-whisper (best for Hindi / Gujarati / English) ─
+                model = _get_whisper()
+                if model is not None:
+                    _LANG_MAP = {"en-US": "en", "hi-IN": "hi", "gu-IN": "gu"}
+                    # initial_prompt seeds the decoder in the target script so
+                    # Whisper outputs native characters instead of Roman transliteration
+                    _PROMPT_MAP = {
+                        "hi-IN": "यह हिंदी में बोला गया है।",
+                        "gu-IN": "આ ગુજરાતી ભાષામાં બોલવામાં આવ્યું છે।",
+                    }
+                    w_lang   = _LANG_MAP.get(lang, None)
+                    w_prompt = _PROMPT_MAP.get(lang, None)
+                    segments, _ = model.transcribe(
+                        tmp.name,
+                        language=w_lang,
+                        task="transcribe",
+                        beam_size=5,
+                        vad_filter=True,
+                        initial_prompt=w_prompt,
+                    )
+                    text = " ".join(s.text for s in segments).strip()
+                # ── Google STT fallback (if faster-whisper not available) ─
+                elif recognizer is not None:
+                    with sr.AudioFile(tmp.name) as src:
+                        audio = recognizer.record(src)
+                    text = recognizer.recognize_google(audio, language=lang)
+            except sr.UnknownValueError:
                 pass
+            except Exception as ex:
+                print(f"  STT error ({lang}): {ex}")
             finally:
                 os.unlink(tmp.name)
+            if text.strip():
+                self._on_text(text.strip())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -416,13 +467,15 @@ def classify_text(text: str) -> dict:
                 model="claude-sonnet-4-6",
                 max_tokens=300,
                 messages=[{"role": "user", "content": (
-                    "You are a transcription formatter. "
+                    "You are a multilingual transcription formatter. "
+                    "The text may be in English, Hindi (Devanagari), or Gujarati. "
                     "Given a raw speech-to-text snippet:\n"
-                    "1. Fix any obvious transcription or grammar errors.\n"
+                    "1. Fix any obvious transcription errors. "
+                    "Keep the original language and script — do NOT translate.\n"
                     "2. Classify it as one of:\n"
                     '   • "sentence"   — a single complete thought\n'
                     '   • "paragraph"  — multiple sentences / a longer idea\n'
-                    '   • "bullet"     — a list item (starts with first/next/also/another etc.)\n'
+                    '   • "bullet"     — a list item\n'
                     "Reply ONLY as valid JSON, no markdown, no extra text:\n"
                     '{"type":"sentence|paragraph|bullet","text":"corrected text"}\n\n'
                     f'Raw snippet: "{clean}"'
@@ -479,219 +532,6 @@ def save_to_docx(entries: list, path: str | None = None) -> str:
     doc.save(path)
     return path
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LinkedIn client  (OAuth 2.0 + UGC Posts API)
-# ══════════════════════════════════════════════════════════════════════════════
-
-_LI_CREDS_FILE = os.path.expanduser("~/.linkedin_credentials.json")
-
-
-class LinkedInClient:
-    _AUTH_URL    = "https://www.linkedin.com/oauth/v2/authorization"
-    _TOKEN_URL   = "https://www.linkedin.com/oauth/v2/accessToken"
-    _PROFILE_URL = "https://api.linkedin.com/v2/me"
-    _POST_URL    = "https://api.linkedin.com/v2/ugcPosts"
-    _REDIRECT    = "http://localhost:8765/callback"
-    _SCOPES      = "r_liteprofile w_member_social"
-
-    def __init__(self):
-        self._client_id     = os.environ.get("LINKEDIN_CLIENT_ID", "")
-        self._client_secret = os.environ.get("LINKEDIN_CLIENT_SECRET", "")
-        self._access_token  = ""
-        self._person_id     = ""
-        self._load()
-
-    # ── persistence ─────────────────────────────────────────────────────────
-
-    def _load(self):
-        if not os.path.exists(_LI_CREDS_FILE):
-            return
-        try:
-            d = json.loads(open(_LI_CREDS_FILE).read())
-            self._access_token  = d.get("access_token", "")
-            self._person_id     = d.get("person_id", "")
-            if not self._client_id:
-                self._client_id     = d.get("client_id", "")
-                self._client_secret = d.get("client_secret", "")
-        except Exception:
-            pass
-
-    def _save(self):
-        with open(_LI_CREDS_FILE, "w") as f:
-            json.dump({
-                "access_token":  self._access_token,
-                "person_id":     self._person_id,
-                "client_id":     self._client_id,
-                "client_secret": self._client_secret,
-            }, f, indent=2)
-        os.chmod(_LI_CREDS_FILE, 0o600)
-
-    # ── public helpers ───────────────────────────────────────────────────────
-
-    def needs_credentials(self) -> bool:
-        return not (self._client_id and self._client_secret)
-
-    def has_token(self) -> bool:
-        return bool(self._access_token and self._person_id)
-
-    def set_credentials(self, client_id: str, client_secret: str):
-        self._client_id     = client_id
-        self._client_secret = client_secret
-
-    # ── OAuth flow ───────────────────────────────────────────────────────────
-
-    def authorize(self) -> tuple[bool, str]:
-        """
-        Open browser → local callback server → exchange code → save token.
-        Returns (success, message).
-        """
-        state = secrets.token_urlsafe(16)
-        auth_url = (
-            self._AUTH_URL + "?" +
-            urllib.parse.urlencode({
-                "response_type": "code",
-                "client_id":     self._client_id,
-                "redirect_uri":  self._REDIRECT,
-                "scope":         self._SCOPES,
-                "state":         state,
-            })
-        )
-
-        result: dict = {}
-
-        class _Handler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                qs = urllib.parse.parse_qs(
-                    urllib.parse.urlparse(self.path).query
-                )
-                result["code"]  = qs.get("code",  [None])[0]
-                result["state"] = qs.get("state", [None])[0]
-                result["error"] = qs.get("error", [None])[0]
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(
-                    b"<h2 style='font-family:sans-serif;margin:40px'>"
-                    b"LinkedIn authorized &#10003;<br>"
-                    b"<small>You can close this tab.</small></h2>"
-                )
-            def log_message(self, *_): pass
-
-        srv = HTTPServer(("localhost", 8765), _Handler)
-        srv.timeout = 120
-
-        print("\nOpening browser for LinkedIn authorization…")
-        print(f"If browser doesn't open, visit:\n  {auth_url}\n")
-        webbrowser.open(auth_url)
-        srv.handle_request()
-        srv.server_close()
-
-        if result.get("error"):
-            return False, f"LinkedIn denied: {result['error']}"
-        if not result.get("code") or result.get("state") != state:
-            return False, "Authorization cancelled or state mismatch."
-
-        return self._exchange_code(result["code"])
-
-    def _exchange_code(self, code: str) -> tuple[bool, str]:
-        body = urllib.parse.urlencode({
-            "grant_type":    "authorization_code",
-            "code":          code,
-            "redirect_uri":  self._REDIRECT,
-            "client_id":     self._client_id,
-            "client_secret": self._client_secret,
-        }).encode()
-        req = urllib.request.Request(self._TOKEN_URL, data=body, method="POST")
-        req.add_header("Content-Type", "application/x-www-form-urlencoded")
-        try:
-            with urllib.request.urlopen(req, timeout=15) as r:
-                token = json.loads(r.read())
-            self._access_token = token.get("access_token", "")
-            self._person_id    = self._fetch_person_id()
-            self._save()
-            return True, "LinkedIn connected!"
-        except Exception as ex:
-            return False, f"Token exchange failed: {ex}"
-
-    def _fetch_person_id(self) -> str:
-        req = urllib.request.Request(self._PROFILE_URL)
-        req.add_header("Authorization",             f"Bearer {self._access_token}")
-        req.add_header("X-Restli-Protocol-Version", "2.0.0")
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read()).get("id", "")
-
-    # ── posting ──────────────────────────────────────────────────────────────
-
-    def post(self, text: str) -> tuple[bool, str]:
-        payload = {
-            "author": f"urn:li:person:{self._person_id}",
-            "lifecycleState": "PUBLISHED",
-            "specificContent": {
-                "com.linkedin.ugc.ShareContent": {
-                    "shareCommentary":   {"text": text},
-                    "shareMediaCategory": "NONE",
-                }
-            },
-            "visibility": {
-                "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"
-            },
-        }
-        data = json.dumps(payload).encode()
-        req  = urllib.request.Request(self._POST_URL, data=data, method="POST")
-        req.add_header("Authorization",             f"Bearer {self._access_token}")
-        req.add_header("Content-Type",              "application/json")
-        req.add_header("X-Restli-Protocol-Version", "2.0.0")
-        try:
-            with urllib.request.urlopen(req, timeout=15) as r:
-                if r.status in (200, 201):
-                    return True, "Posted to LinkedIn!"
-            return False, "LinkedIn returned unexpected status."
-        except urllib.error.HTTPError as ex:
-            body = ex.read().decode()
-            if ex.code == 401:
-                # token expired — clear it
-                self._access_token = ""; self._person_id = ""; self._save()
-                return False, "Token expired — press P to re-authorize."
-            return False, f"HTTP {ex.code}: {body[:120]}"
-        except Exception as ex:
-            return False, str(ex)
-
-
-def _format_linkedin_post(transcriptions: list) -> str:
-    """
-    Use Claude claude-sonnet-4-6 to turn raw transcription entries into an
-    engaging, properly formatted LinkedIn post with hashtags.
-    Falls back to plain concatenation if no API key.
-    """
-    client = _get_ai()
-    raw_lines = []
-    for e in transcriptions:
-        t   = e.get("type", "sentence")
-        txt = e.get("text", "")
-        raw_lines.append(f"• {txt}" if t == "bullet" else txt)
-    raw = "\n".join(raw_lines)
-
-    if not client:
-        return raw
-
-    try:
-        msg = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=600,
-            messages=[{"role": "user", "content": (
-                "You are a LinkedIn content writer. "
-                "Rewrite the following speech transcription as a professional, "
-                "engaging LinkedIn post. Keep the core ideas, improve the language, "
-                "add line breaks for readability, and append 3-5 relevant hashtags. "
-                "Keep total length under 1200 characters.\n\n"
-                f"Transcription:\n{raw}"
-            )}]
-        )
-        return msg.content[0].text.strip()
-    except Exception:
-        return raw
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # Text side-panel renderer
 # ══════════════════════════════════════════════════════════════════════════════
@@ -699,6 +539,78 @@ def _format_linkedin_post(transcriptions: list) -> str:
 _TYPE_COL = {"sentence": (215,215,215), "paragraph": (155,205,255), "bullet": (85,250,125)}
 _TYPE_BG  = {"sentence": (28, 28, 45),  "paragraph": (22, 38,  62), "bullet": (18, 48,  28)}
 _FONT     = cv2.FONT_HERSHEY_SIMPLEX
+
+# ── language support ────────────────────────────────────────────────────────
+# (google-stt code, display label, Noto font path covering that script)
+LANGUAGES = [
+    ("en-US", "English",  "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"),
+    ("hi-IN", "हिंदी",    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf"),
+    ("gu-IN", "ગુજરાતી", "/usr/share/fonts/truetype/noto/NotoSansGujarati-Regular.ttf"),
+]
+
+_FONT_SIZE_PANEL = 16   # px — used for transcription entries in the side panel
+
+try:
+    from PIL import ImageFont as _IFont, ImageDraw as _IDraw, Image as _IImage
+    _PIL_OK = True
+except ImportError:
+    _PIL_OK = False
+
+# pre-load Pillow fonts for each language
+_PIL_FONTS: dict[str, object] = {}
+if _PIL_OK:
+    for _code, _label, _fpath in LANGUAGES:
+        try:
+            _PIL_FONTS[_code] = _IFont.truetype(_fpath, _FONT_SIZE_PANEL)
+        except Exception:
+            try:
+                _PIL_FONTS[_code] = _IFont.load_default()
+            except Exception:
+                pass
+
+
+def _font_for_text(text: str):
+    """Pick the correct Pillow font based on the Unicode script in the text."""
+    for ch in text:
+        cp = ord(ch)
+        if 0x0A80 <= cp <= 0x0AFF:        # Gujarati block
+            return _PIL_FONTS.get("gu-IN")
+        if 0x0900 <= cp <= 0x097F:        # Devanagari block (Hindi)
+            return _PIL_FONTS.get("hi-IN")
+    return _PIL_FONTS.get("en-US")
+
+
+def _wrap_unicode(text: str, max_w: int, font) -> list[str]:
+    """Word-wrap Unicode text using Pillow's font metrics."""
+    if not _PIL_OK or font is None:
+        return [text]
+    words, lines, line = text.split(), [], ""
+    dummy = _IImage.new("RGB", (1, 1))
+    draw  = _IDraw.Draw(dummy)
+    for w in words:
+        test = (line + " " + w).strip()
+        bbox = draw.textbbox((0, 0), test, font=font)
+        if bbox[2] <= max_w:
+            line = test
+        else:
+            if line:
+                lines.append(line)
+            line = w
+    if line:
+        lines.append(line)
+    return lines or [""]
+
+
+def _draw_unicode(panel: np.ndarray, text: str, pos: tuple,
+                  color: tuple, font) -> np.ndarray:
+    """Render a single Unicode string onto a BGR numpy array using Pillow."""
+    if not _PIL_OK or font is None:
+        cv2.putText(panel, text, pos, _FONT, 0.42, color, 1, cv2.LINE_AA)
+        return panel
+    pil = _IImage.fromarray(cv2.cvtColor(panel, cv2.COLOR_BGR2RGB))
+    draw = _IDraw.Draw(pil)
+    draw.text(pos, text, font=font, fill=(color[2], color[1], color[0]))
+    return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
 
 def _wrap(text: str, max_w: int, scale: float = 0.42) -> list[str]:
@@ -715,15 +627,20 @@ def _wrap(text: str, max_w: int, scale: float = 0.42) -> list[str]:
 
 
 def render_panel(entries: list, height: int, recording: bool,
-                 notify: str = "", speaking: bool = False) -> np.ndarray:
+                 notify: str = "", speaking: bool = False,
+                 lang_code: str = "en-US", lang_label: str = "English") -> np.ndarray:
     w     = PANEL_W
     panel = np.full((height, w, 3), (17, 17, 27), dtype=np.uint8)
-    LH    = 17   # line height px
+    LH    = _FONT_SIZE_PANEL + 4   # line height = font size + leading
 
     # ── header ──────────────────────────────────────────────
     cv2.rectangle(panel, (0, 0), (w, 46), (26, 26, 46), -1)
     cv2.putText(panel, "NOTES  /  TRANSCRIPTION", (10, 29),
                 _FONT, 0.54, (175, 175, 215), 1, cv2.LINE_AA)
+    # language badge
+    lang_col = (80, 200, 120) if lang_code == "en-US" else (80, 160, 255)
+    panel = _draw_unicode(panel, lang_label, (10, 34), lang_col,
+                          _PIL_FONTS.get(lang_code))
     # mic + speaking dots
     if recording:
         blink = int(time.time() * 2) % 2 == 0
@@ -736,27 +653,43 @@ def render_panel(entries: list, height: int, recording: bool,
     # ── notification bar ────────────────────────────────────
     if notify:
         cv2.rectangle(panel, (0, 47), (w, 68), (20, 50, 20), -1)
-        cv2.putText(panel, notify, (8, 62), _FONT, 0.40, (80, 220, 80), 1, cv2.LINE_AA)
+        cv2.putText(panel, notify[:60], (8, 62), _FONT, 0.40, (80, 220, 80), 1, cv2.LINE_AA)
 
     # ── entries (newest at bottom) ──────────────────────────
     FOOTER_H = 42
     y = height - FOOTER_H - 6
 
     for e in reversed(entries):
-        t   = e.get("type", "sentence")
-        col = _TYPE_COL.get(t, (200, 200, 200))
-        bg  = _TYPE_BG.get(t,  (28, 28, 45))
-        pre = "• " if t == "bullet" else ""
-        lines     = _wrap(pre + e.get("text", ""), w - 22)
-        block_h   = len(lines) * LH + 10
-        y        -= block_h
+        t    = e.get("type", "sentence")
+        col  = _TYPE_COL.get(t, (200, 200, 200))
+        bg   = _TYPE_BG.get(t,  (28, 28, 45))
+        pre  = "• " if t == "bullet" else ""
+        txt  = pre + e.get("text", "")
+        is_ascii = all(ord(c) < 128 for c in txt)
+
+        # always pick font based on what script the TEXT is actually in
+        e_font = _font_for_text(txt) if _PIL_OK else None
+
+        if is_ascii or not _PIL_OK:
+            lines = _wrap(txt, w - 22)
+        else:
+            lines = _wrap_unicode(txt, w - 26, e_font)
+
+        block_h = len(lines) * LH + 10
+        y      -= block_h
         if y < 70:
             break
         cv2.rectangle(panel, (3, y - 1), (w - 3, y + block_h), bg, -1)
         ts_str = e.get("ts", "")
         cv2.putText(panel, ts_str, (w - 52, y + 10), _FONT, 0.30, (70,70,100), 1)
-        for i, ln in enumerate(lines):
-            cv2.putText(panel, ln, (8, y + 13 + i * LH), _FONT, 0.42, col, 1, cv2.LINE_AA)
+
+        if is_ascii or not _PIL_OK:
+            for i, ln in enumerate(lines):
+                cv2.putText(panel, ln, (8, y + 13 + i * LH),
+                            _FONT, 0.42, col, 1, cv2.LINE_AA)
+        else:
+            for i, ln in enumerate(lines):
+                panel = _draw_unicode(panel, ln, (8, y + 12 + i * LH), col, e_font)
         y -= 3
 
     # ── footer ──────────────────────────────────────────────
@@ -764,13 +697,13 @@ def render_panel(entries: list, height: int, recording: bool,
     cv2.line(panel, (0, height - FOOTER_H), (w, height - FOOTER_H), (48, 48, 78), 1)
     cv2.putText(panel, "S: mic on/off    W: save .docx    C: clear",
                 (8, height - 25), _FONT, 0.37, (105, 105, 135), 1, cv2.LINE_AA)
-    cv2.putText(panel, "L: lip overlay   B: re-capture BG    Q: quit",
+    cv2.putText(panel, "N: language      L: lip overlay   Q: quit",
                 (8, height - 10), _FONT, 0.37, (105, 105, 135), 1, cv2.LINE_AA)
 
     # ── type legend (top-right corner) ──────────────────────
-    for i, (label, col) in enumerate([("sentence", (215,215,215)),
+    for i, (label, col) in enumerate([("sentence",  (215,215,215)),
                                        ("paragraph", (155,205,255)),
-                                       ("bullet",   ( 85,250,125))]):
+                                       ("bullet",    ( 85,250,125))]):
         cv2.circle(panel, (w - 12, 58 + i * 14), 4, col, -1)
         cv2.putText(panel, label, (w - 80, 62 + i * 14), _FONT, 0.30, col, 1)
 
@@ -835,15 +768,18 @@ class InvisibilitySystem:
         self._session_doc: str | None = None   # auto-save path for current session
         self._notify      = ""
         self._notify_f    = 0
+        # language: index into LANGUAGES list (0=English, 1=Hindi, 2=Gujarati)
+        self._lang_idx    = 0
+
+        # start Whisper model download immediately in background
+        if WHISPER_AVAILABLE:
+            threading.Thread(target=_preload_whisper, daemon=True).start()
 
         # ── lip detection ───────────────────────────────────
         self.lip_overlay = False
         self._lip_det: LipDetector | None = None
         self._lip_speaking = False
 
-        # ── LinkedIn ─────────────────────────────────────────
-        self._linkedin: LinkedInClient | None = None
-        self._li_busy = False
 
         # ── MediaPipe hand ──────────────────────────────────
         self.hand_det = build_hand_detector()
@@ -1010,7 +946,7 @@ class InvisibilitySystem:
 
         cv2.putText(frame,
             "D:Draw  E:Snap  👆👆:Square  Pinch:Ghost  L-hand:Cloak  "
-            "S:Mic  L:Lips  W:.docx  P:LinkedIn  F:Focus  R:Region  C:Clear  B:BG  Q:Quit",
+            "S:Mic  N:Language  L:Lips  W:.docx  F:Focus  R:Region  C:Clear  B:BG  Q:Quit",
             (8, h - 10), _FONT, 0.33, (150,150,150), 1, cv2.LINE_AA)
 
         if gesture:
@@ -1050,40 +986,15 @@ class InvisibilitySystem:
         except Exception as ex:
             print(f"  auto-save error: {ex}")
 
-    # ── LinkedIn helpers ──────────────────────────────────────────────────
-
-    def _linkedin_init(self) -> LinkedInClient:
-        if self._linkedin is None:
-            self._linkedin = LinkedInClient()
-        return self._linkedin
-
-    def _linkedin_auth_thread(self):
-        li = self._linkedin_init()
-        ok, msg = li.authorize()
-        self._notify   = msg
-        self._notify_f = 200
-        self._li_busy  = False
-        print(f"  LinkedIn: {msg}")
-
-    def _linkedin_post_thread(self):
-        li = self._linkedin_init()
-        print("  Formatting post with Claude claude-sonnet-4-6…")
-        text = _format_linkedin_post(self.transcriptions)
-        print(f"  Post preview ({len(text)} chars):\n{text[:300]}{'…' if len(text)>300 else ''}\n")
-        ok, msg = li.post(text)
-        self._notify   = msg
-        self._notify_f = 220
-        self._li_busy  = False
-        print(f"  LinkedIn: {msg}")
 
     # ── main loop ─────────────────────────────────────────────────────────
 
     def run(self):
         print("\nReady!")
         print("  S  → start/stop microphone (speech to text in side panel)")
+        print("  N  → cycle language: English → हिंदी → ગુજરાતી → English")
         print("  L  → lip overlay (face landmarker)")
         print("  W  → save transcription as .docx Word document")
-        print("  P  → post transcription to LinkedIn (OAuth on first use)")
         print("  D  → air-drawing mode  |  E: snap shape  |  C: clear all")
         print("  👆👆 hold 1 s → save frame square")
         print("  Pinch / L-hand → invisibility  |  F/R → focus mode  |  Q: quit\n")
@@ -1192,8 +1103,12 @@ class InvisibilitySystem:
 
             # ── build combined display ────────────────────────────────────
             recording = bool(self._recorder and self._recorder.active)
+            _lcode, _llabel, _ = LANGUAGES[self._lang_idx]
+            # show Whisper load status if model not ready yet
+            _display_notify = _WHISPER_STATUS if _WHISPER_STATUS else self._notify
             panel = render_panel(self.transcriptions, h, recording,
-                                 self._notify, self._lip_speaking)
+                                 _display_notify, self._lip_speaking,
+                                 lang_code=_lcode, lang_label=_llabel)
             cv2.imshow(WINDOW, np.hstack([display, panel]))
 
             # ── keyboard ──────────────────────────────────────────────────
@@ -1233,8 +1148,10 @@ class InvisibilitySystem:
                         self._recorder = AudioRecorder(
                             lambda t: self._speech_q.put(t)
                         )
+                    code, label, _ = LANGUAGES[self._lang_idx]
+                    self._recorder.language = code
                     self._recorder.start()
-                    print("● Recording — speak now.  Press S again to stop.")
+                    print(f"● Recording [{label}] — speak now.  Press S to stop, N to switch language.")
                 else:
                     self._recorder.stop()
                     print("■ Recording stopped.")
@@ -1263,6 +1180,15 @@ class InvisibilitySystem:
                     self.lip_overlay = False
                     print("Lip overlay OFF.")
 
+            elif key == ord('n'):
+                self._lang_idx = (self._lang_idx + 1) % len(LANGUAGES)
+                code, label, _ = LANGUAGES[self._lang_idx]
+                if self._recorder:
+                    self._recorder.language = code
+                self._notify   = f"Language: {label}  ({code})"
+                self._notify_f = 180
+                print(f"  Language → {label} ({code})")
+
             elif key == ord('w'):
                 if not self.transcriptions:
                     print("Nothing transcribed yet — press S to start the mic.")
@@ -1278,37 +1204,6 @@ class InvisibilitySystem:
                     except Exception as ex:
                         print(f"Save error: {ex}")
 
-            elif key == ord('p'):
-                if not self.transcriptions:
-                    print("Nothing to post — record some speech first (S key).")
-                elif self._li_busy:
-                    print("LinkedIn operation already in progress…")
-                else:
-                    li = self._linkedin_init()
-                    if li.needs_credentials():
-                        print("\n── LinkedIn Setup ─────────────────────────────────")
-                        print("1. Go to https://www.linkedin.com/developers/apps")
-                        print("2. Create app → Products → 'Share on LinkedIn'")
-                        print("3. Auth tab → copy Client ID + Client Secret")
-                        print("4. Auth tab → add redirect URL: http://localhost:8765/callback")
-                        print("5. Set env vars and restart:")
-                        print("     export LINKEDIN_CLIENT_ID=your_id")
-                        print("     export LINKEDIN_CLIENT_SECRET=your_secret")
-                        print("───────────────────────────────────────────────────\n")
-                        self._notify   = "Set LINKEDIN_CLIENT_ID + SECRET (see console)"
-                        self._notify_f = 240
-                    elif not li.has_token():
-                        self._li_busy = True
-                        self._notify   = "Opening browser for LinkedIn auth…"
-                        self._notify_f = 240
-                        threading.Thread(target=self._linkedin_auth_thread,
-                                         daemon=True).start()
-                    else:
-                        self._li_busy = True
-                        self._notify   = "Formatting + posting to LinkedIn…"
-                        self._notify_f = 240
-                        threading.Thread(target=self._linkedin_post_thread,
-                                         daemon=True).start()
 
             elif key == ord('c'):
                 self.drawn_squares.clear(); self.air_shapes.clear()
